@@ -192,3 +192,38 @@ gcloud run services describe ayna-api --region=us-west1 --format='value(spec.tem
 **A 401 from the app** — the deployed service has its own `AUTH0_AUDIENCE`
 from step 7. If it does not match the app's, every request fails with an error
 that deliberately does not say why.
+
+## Rotating the database credential
+
+Neon invalidates the old password the moment you reset it, so production is
+down between the reset and the Cloud Run update. Expect a few minutes.
+
+```bash
+# 1. Neon Console -> the branch whose endpoint is ep-odd-grass-af53tzce (main,
+#    NOT dev) -> Connect -> Reset password. Both branches hold a database
+#    called neondb, so check the ENDPOINT HOST, never the database name.
+
+# 2. Store it. Note the sed: .env quotes the value, and a DSN that begins with
+#    a double quote is one pgx cannot parse. It falls back to a unix socket as
+#    user "nonroot", the container exits before binding the port, and Cloud Run
+#    reports only "failed to start and listen on the port" -- which looks like
+#    a port problem and is not. This exact mistake cost a deploy cycle.
+grep -m1 '^DATABASE_URL=' .env \
+  | sed -E 's/^DATABASE_URL=//; s/^"//; s/"$//' \
+  | tr -d '\r\n' \
+  | gcloud secrets versions add ayna-database-url --data-file=-
+
+# 3. Check the stored value before deploying it. Cheaper than a failed rollout.
+gcloud secrets versions access latest --secret=ayna-database-url | head -c 13   # postgresql://
+
+# 4. New revisions. :latest is resolved at container start, so a running
+#    revision keeps the old value until it is replaced.
+gcloud run services update ayna-api    --region=us-west1 --update-secrets=DATABASE_URL=ayna-database-url:latest
+gcloud run services update ayna-worker --region=us-west1 --update-secrets=DATABASE_URL=ayna-database-url:latest
+
+# 5. Verify. /readyz is the one that touches Postgres.
+curl -fsS "$(gcloud run services describe ayna-api --region=us-west1 --format='value(status.url)')/readyz"
+```
+
+If step 5 still reports `password authentication failed`, the reset landed on
+the wrong branch and the exposed credential is still live. Go back to step 1.
