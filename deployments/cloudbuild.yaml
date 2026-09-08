@@ -19,6 +19,18 @@ substitutions:
   # name. Pass _TAG explicitly; the default keeps a bare submit working.
   _TAG: manual
 
+  # Defaulted so `gcloud builds submit --config deployments/cloudbuild.yaml`
+  # works on its own. Without these the build fails at submission with "key in
+  # the template _AUTH0_DOMAIN is not matched in the substitution data", after
+  # uploading the tarball -- a confusing place to fail, and it happened during
+  # an incident when the last thing anyone needed was a puzzle.
+  #
+  # Neither value is a secret. The tenant domain is public (the mobile client
+  # ships it), and the audience is an identifier, not a credential. The actual
+  # secrets stay in Secret Manager and are referenced by name below.
+  _AUTH0_DOMAIN: dev-yqk2n1s3sblxcyyj.us.auth0.com
+  _AUTH0_AUDIENCE: https://api.ayna.app
+
 steps:
   # --- build ---------------------------------------------------------------
   # Both images come from one Dockerfile, differing only by which cmd/ package

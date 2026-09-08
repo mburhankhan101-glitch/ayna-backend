@@ -131,7 +131,7 @@ gcloud projects add-iam-policy-binding $proj `
 
 ```powershell
 gcloud builds submit --config deployments/cloudbuild.yaml `
-    --substitutions=_REGION=us-west1,_AUTH0_DOMAIN=dev-yqk2n1s3sblxcyyj.us.auth0.com,_AUTH0_AUDIENCE=https://api.ayna.app
+    --substitutions=_REGION=us-west1
 ```
 
 First run takes a few minutes: it uploads the source, builds two images, and
