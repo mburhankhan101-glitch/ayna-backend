@@ -48,10 +48,31 @@ func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 func TestProbeEndpointsExistAtTheExpectedPaths(t *testing.T) {
 	h := serve(t)
 
-	for _, path := range []string{"/healthz", "/readyz"} {
+	for _, path := range []string{"/livez", "/healthz", "/readyz"} {
 		if code := get(t, h, path).Code; code == http.StatusNotFound {
 			t.Errorf("%s returned 404 — Cloud Run's probe would fail", path)
 		}
+	}
+}
+
+// /livez exists so liveness is checkable from outside the platform.
+//
+// Cloud Run's edge answers the exact path "/healthz" with Google's own HTML
+// 404 and never delivers the request to the container. Neighbouring paths
+// (/healthz2, /Healthz, /healthz/, /livez) all arrive normally, so this is one
+// reserved string rather than a prefix or a pattern.
+//
+// Nothing was ever down because of this: Cloud Run's probe reaches the
+// container below the front end, and this service uses a TCP probe on the port
+// rather than an HTTP one. What it broke was checking, since every curl of
+// /healthz against the public URL looks like a dead service.
+//
+// The honest limit of this test: it cannot reproduce the interception, which
+// happens outside the process. What it can do is fail if someone deletes
+// /livez as an apparent duplicate of /healthz, which is how this regresses.
+func TestLivezExistsBecauseHealthzIsUnreachableOnCloudRun(t *testing.T) {
+	if code := get(t, serve(t), "/livez").Code; code != http.StatusOK {
+		t.Fatalf("/livez = %d, want 200 — the only liveness path reachable from outside", code)
 	}
 }
 

@@ -81,6 +81,10 @@ func run() error {
 	)
 
 	mux := http.NewServeMux()
+	// /livez, not /healthz: Cloud Run's edge swallows the exact path
+	// "/healthz" and never delivers it to the container. See cmd/api/main.go
+	// for the full finding. Both are registered; only /livez is reachable.
+	mux.HandleFunc("GET /livez", h.Live)
 	mux.HandleFunc("GET /healthz", h.Live)
 	mux.HandleFunc("GET /readyz", h.Ready)
 	mux.HandleFunc("POST /wake", wake(log))

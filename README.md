@@ -53,11 +53,11 @@ go run ./cmd/api
 ```
 
 ```bash
-curl localhost:8080/healthz
+curl localhost:8080/livez
 curl localhost:8080/readyz
 ```
 
-`/healthz` answers 200 whenever the process is running. `/readyz` answers 503
+`/livez` answers 200 whenever the process is running (`/healthz` is registered too, but Cloud Run swallows that exact path). `/readyz` answers 503
 if Postgres is unreachable. That distinction is deliberate — see below.
 
 Everything CI runs, run locally:
@@ -96,7 +96,7 @@ that is the whole reason the spec exists.
 
 ## Seven things here that are decisions, not boilerplate
 
-**Liveness and readiness are different endpoints.** `/healthz` checks nothing
+**Liveness and readiness are different endpoints.** `/livez` and `/healthz` check nothing
 external; `/readyz` checks Postgres. If liveness pinged the database, a brief
 database blip would make every instance look dead, the platform would restart
 all of them at once, and a recoverable outage would become a total one.

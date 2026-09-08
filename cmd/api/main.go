@@ -153,6 +153,23 @@ func routes(
 
 	// Probes are deliberately outside the auth middleware: Cloud Run's health
 	// checks present no credentials, and a 401 there is an unhealthy revision.
+	//
+	// /livez exists so liveness can be checked from OUTSIDE the platform.
+	//
+	// Cloud Run's front end answers the exact string "/healthz" with its own
+	// HTML 404 and never forwards it; /healthz2, /Healthz, /healthz/ and /livez
+	// all arrive here normally, which is how it was isolated.
+	//
+	// This is not an outage and never was. Cloud Run's own probe reaches the
+	// container below the front end, and this service is configured with a TCP
+	// probe on the port rather than an HTTP one, so nothing depended on the path
+	// being externally routable. What it broke was *checking*: every curl of
+	// /healthz against the public URL returns 404 and looks like a dead service.
+	//
+	// Both paths stay registered. /healthz is correct on every other platform
+	// and in the tests; /livez is the one to curl from a laptop or an uptime
+	// monitor.
+	mux.HandleFunc("GET /livez", h.Live)
 	mux.HandleFunc("GET /healthz", h.Live)
 	mux.HandleFunc("GET /readyz", h.Ready)
 

@@ -151,7 +151,7 @@ curl "$api/readyz"
 `"postgres":"ok"` from `/readyz` means the deployed container reached Neon —
 the same check that passed locally, now from Google's network.
 
-**Do not curl `/healthz` on a `*.a.run.app` URL.** Google's front end answers that
+**Curl `/livez`, not `/healthz`, on a `*.a.run.app` URL.** Google's front end answers that
 exact path itself with its own HTML 404; the request never reaches the
 container. Every neighbouring path (`/healthzz`, `/readyz`, `/v1/users`) does
 reach it, which is how this was isolated. The route is still registered and
