@@ -49,7 +49,20 @@ jobs:
 
   deploy:
     needs: check
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # DEPLOY_TO_CLOUD_RUN is a repository variable, and it gates this job so a
+    # clone or a fresh repo runs the checks and stops there.
+    #
+    # Without it the first push to a new repo fails: the job authenticates with
+    # Workload Identity Federation, which needs GCP_WIF_PROVIDER and
+    # GCP_SERVICE_ACCOUNT to exist. A red cross on the front page of a portfolio
+    # repo reads as broken code, when in fact nothing is wrong with it.
+    #
+    # Set it once the WIF pool and the secrets exist:
+    #   gh variable set DEPLOY_TO_CLOUD_RUN --body true
+    if: |
+      github.ref == 'refs/heads/main'
+      && github.event_name == 'push'
+      && vars.DEPLOY_TO_CLOUD_RUN == 'true'
     runs-on: ubuntu-latest
 
     # Workload Identity Federation instead of a long-lived service-account
