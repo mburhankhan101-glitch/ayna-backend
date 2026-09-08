@@ -1,13 +1,24 @@
 # ayna-backend
 
-Go modular monolith + AI worker (ADR-001, ADR-002). Deploys to Cloud Run,
-Postgres on Neon.
+Go modular monolith + worker (ADR-001, ADR-002) for **Ayna** (آئینہ, "mirror" in
+Urdu) — an AI skin analysis app. Cloud Run, Postgres on Neon, Auth0 for
+identity.
 
-**Steps 1–2 of the wiring order are complete.** The deploy pipeline is proven
-before any domain code exists, and the API and event contracts are written and
-enforced. What runs today is configuration, structured logging, a connection
-pool, health probes, graceful shutdown, the module boundary lint, and the
-contract drift tests. No business logic yet — deliberately.
+> Part of a four-repo project:
+> **[ayna-backend](https://github.com/mburhankhan101-glitch/ayna-backend)** (you are here) ·
+> [ayna-app](https://github.com/mburhankhan101-glitch/ayna-app) ·
+> [ayna-spike](https://github.com/mburhankhan101-glitch/ayna-spike) ·
+> [ayna-docs](https://github.com/mburhankhan101-glitch/ayna-docs)
+>
+> Start with [ayna-docs](https://github.com/mburhankhan101-glitch/ayna-docs) for
+> why any of this is shaped the way it is.
+
+Portfolio project, not a business.
+
+**The whole journey runs on live infrastructure.** Sign in → capture → analyse
+→ report → history → trend, against a real paid vision vendor, deployed and
+serving. Two modules (`iam`, `skinanalysis`), ~100 tests, plus two test suites
+that fail the build on architectural drift rather than on behaviour.
 
 ## Layout
 
@@ -15,7 +26,10 @@ contract drift tests. No business logic yet — deliberately.
 cmd/api/        composition root for the monolith
 cmd/worker/     composition root for the AI worker
 internal/
-  modules/      one package per bounded context (see its README)
+  modules/
+    iam/        accounts, the 18+ gate, consent, allowance, photo retention
+    skinanalysis/ scan submission, the vendor adapter, overlays, trend
+                  each: domain/ application/ infrastructure/
   platform/     cross-cutting, NOT business logic
     config/     env loading, validated at startup
     logger/     slog + correlation IDs (NFR-9)
@@ -26,7 +40,8 @@ internal/
   contracts/    contract drift tests — openapi.yaml vs the event schemas
 api/            openapi.yaml — the REST contract, and what the Flutter client generates from
 events/         JSON Schema — the event envelope and the two riskiest payloads
-deployments/    Dockerfile
+migrations/     goose migrations
+deployments/    Dockerfile, cloudbuild.yaml, SETUP.md, RETENTION.md
 ```
 
 ## Running locally
@@ -79,7 +94,7 @@ the vendor does not bill failed requests, and neither should you.
 Generate the Dart client from the same file rather than hand-writing models —
 that is the whole reason the spec exists.
 
-## Five things here that are decisions, not boilerplate
+## Seven things here that are decisions, not boilerplate
 
 **Liveness and readiness are different endpoints.** `/healthz` checks nothing
 external; `/readyz` checks Postgres. If liveness pinged the database, a brief
@@ -96,13 +111,25 @@ scales to zero, so SIGTERM arrives on every scale-down, not just on deploys.
 `SHUTDOWN_GRACE` is validated to stay under the platform's 10-second SIGKILL
 window; exceeding it guarantees requests are cut off rather than drained.
 
-**The worker has an HTTP server.** It runs on Cloud Run, which scales to zero,
-and River is a *pull* queue — a process scaled to zero polls nothing. So the
-API fires a fire-and-forget ping at `POST /wake` after committing, and Cloud
-Scheduler hits the same endpoint as a safety net. The ping is an
-**optimisation, never a correctness requirement**: the job is already committed
-in Postgres in the same transaction as the scan, so a lost ping costs latency,
-never a scan.
+**Modules never import each other.** `skinanalysis` declares the `Identity`
+port it needs, `iam` declares `AllowanceSource`, and `cmd/api/{identity,
+allowance}.go` — the composition root, the one place allowed to know both —
+satisfies each. The retention sweep in `cmd/worker/retention.go` is the same
+pattern: it needs each user's policy (iam) and which stored images are past it
+(skinanalysis), and a `users ⋈ scans` join would have passed the boundary lint,
+because that lint reads Go imports and not SQL tables, while welding the two
+modules together exactly as the rule forbids.
+
+**The worker is closed to the internet and authenticated by the platform.** It
+runs `--no-allow-unauthenticated`, so Cloud Run rejects any caller without a
+valid OIDC token from a service account holding `roles/run.invoker` before the
+request reaches Go. There is no shared secret in the handler on purpose: a
+hand-rolled header check would be a weaker mechanism sitting in front of a
+stronger one, plus a secret to rotate.
+
+**API concurrency is 8, not the default 80.** `photo.TrimTall` decodes JPEGs,
+so a scan holds 15–20MB in flight; 80 of those against a 512Mi instance is an
+out-of-memory kill, not throughput.
 
 **The boundary lint is a test, not a convention.** `internal/arch` fails the
 build if a `domain` package imports anything outside the standard library, or
@@ -126,9 +153,13 @@ Two Cloud Run settings that are cost controls rather than tuning:
 
 ### One-time setup
 
-Neither Docker nor gcloud is installed on the machine this was scaffolded on,
-so the steps below have **not been executed** — they are the sequence to run,
-not a record of one.
+This has been executed; the service is live. `deployments/SETUP.md` is the
+worked version with the mistakes that actually came up, and
+`deployments/RETENTION.md` covers the scheduled photo-retention sweep.
+
+The deploy job is gated on a `DEPLOY_TO_CLOUD_RUN` repository variable, so a
+fresh clone runs the checks and stops there rather than failing on GCP secrets
+it has no reason to hold.
 
 ```bash
 # 1. Neon: create a project, copy the pooled connection string into .env
@@ -162,10 +193,19 @@ curl -fsS "$(gcloud run services describe ayna-api \
 
 ## Not done yet
 
-No domain code. Steps 2–7 of the wiring order in
-`09-Infrastructure-and-Services` add Auth0 + Resend, R2, River, Upstash, then
-observability, then FCM. Each should leave something that runs.
+- **Store billing.** No Billing module. The app's paywall says "Plus is not on
+  sale yet" and means it. `entitlement.tier` is still hardcoded to `free`;
+  the *counts* are not, and that distinction is the point — see above.
+- **Email OTP** (PD-3). Sign-in currently uses Auth0's Google connection.
+- **The retention sweep has no scheduler yet.** The endpoint, the policy and
+  the setting all exist; until the Cloud Scheduler job in
+  `deployments/RETENTION.md` is created, nothing calls it.
+- **R-1 is open.** The vendor's acne score may under-report. Until one
+  controlled photograph settles it, the report screen must not lead on
+  breakouts. See
+  [ADR-003](https://github.com/mburhankhan101-glitch/ayna-docs/blob/main/06-AI-Provider-Evaluation.md).
 
-The Dockerfile and the deploy workflow are **written but unexecuted** — no
-Docker or gcloud on this machine. Expect the first real deploy to surface
-something; that is what step 1 is for.
+Two files describe one deployment — `deployments/cloudbuild.yaml` and
+`.github/workflows/deploy.yml`. They have drifted once already (the workflow
+sat at `--concurrency=80` with no vendor API key long after the scan path began
+decoding images), so keep them in step or collapse them.
