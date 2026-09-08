@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.ayna.app/events/skinanalysis.report.generated.v1.schema.json",
+  "title": "SkinReportGenerated v1",
+  "description": "Analysis completed. Subscribed to by Skin Profile (trend), Recommendations (tips), and Notifications (the push that covers a backgrounded app, PD-4).",
+  "type": "object",
+  "required": ["scanId", "userId", "overallScore", "issues", "rulesetVersion", "generatedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "scanId": { "type": "string", "pattern": "^scn_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "userId": { "type": "string", "pattern": "^usr_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "overallScore": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Higher is better. Already rescaled from the vendor range." },
+    "skinAge": { "type": ["integer", "null"], "description": "Null on tiers with no skin-age reading. Null is a real value here, not a missing one." },
+    "issues": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "description": "All six, always. An unmeasured concern appears with severity 'unknown' rather than being omitted — otherwise a consumer cannot distinguish 'we looked and found nothing' from 'we never looked'.",
+      "items": {
+        "type": "object",
+        "required": ["type", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "enum": ["acne", "redness", "dryness", "dark_spots", "texture", "pores"] },
+          "severity": { "enum": ["unknown", "none", "mild", "moderate", "severe"] },
+          "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+          "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+          "severityLevels": { "enum": [2, 4] }
+        }
+      }
+    },
+    "referralSuggested": { "type": "boolean" },
+    "rulesetVersion": {
+      "type": "string",
+      "description": "Which SeverityRuleSet produced these severities (PD-2). On the event, not just the read model, so the compliance audit trail can reconstruct why a referral fired without joining back to mutable state."
+    },
+    "heatmapRef": { "type": ["string", "null"] },
+    "generatedAt": { "type": "string", "format": "date-time" }
+  }
+}

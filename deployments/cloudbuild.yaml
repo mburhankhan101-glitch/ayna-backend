@@ -1,0 +1,148 @@
+# Builds and deploys both services without Docker on the developer's machine.
+#
+# `gcloud builds submit` uploads the source, builds in the cloud, and deploys.
+# That matters here beyond convenience: Docker Desktop is a multi-gigabyte
+# install on a laptop that was recently down to 2 GB free, and the only thing
+# it would be used for is producing an image that Cloud Build produces anyway.
+#
+#   gcloud builds submit --config deployments/cloudbuild.yaml \
+#       --substitutions=_REGION=us-west1,_TAG=$(date +%Y%m%d-%H%M%S)
+#
+# The GitHub Actions workflow does not use this file -- it runs its own docker
+# build/push/deploy against the same registry. This is the manual path.
+
+substitutions:
+  _REGION: us-west1
+  _REPO: ayna
+  # $SHORT_SHA is empty for `builds submit`: the source arrives as an uploaded
+  # tarball with no commit attached, which produced an unparseable "api:" image
+  # name. Pass _TAG explicitly; the default keeps a bare submit working.
+  _TAG: manual
+
+steps:
+  # --- build ---------------------------------------------------------------
+  # Both images come from one Dockerfile, differing only by which cmd/ package
+  # is compiled. Built in parallel (no `waitFor` dependency between them)
+  # because neither needs the other.
+
+  - id: build-api
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - deployments/Dockerfile
+      - --build-arg
+      - CMD=api
+      - --build-arg
+      - VERSION=${_TAG}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:${_TAG}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:latest
+      - .
+    waitFor: ['-']
+
+  - id: build-worker
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - deployments/Dockerfile
+      - --build-arg
+      - CMD=worker
+      - --build-arg
+      - VERSION=${_TAG}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker:${_TAG}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker:latest
+      - .
+    waitFor: ['-']
+
+  # --- push ----------------------------------------------------------------
+  # The top-level `images:` field cannot do this job: it pushes only after every
+  # step has finished, so the deploy steps below would reference a tag that does
+  # not exist yet. That failed the first deploy with "Image ... not found".
+  # --all-tags covers both ${_TAG} and :latest in one command.
+
+  - id: push-api
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api']
+    waitFor: ['build-api']
+
+  - id: push-worker
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker']
+    waitFor: ['build-worker']
+
+  # --- deploy --------------------------------------------------------------
+
+  - id: deploy-api
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ayna-api
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:${_TAG}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --min-instances=0
+      - --max-instances=4
+      - --cpu=1
+      - --memory=512Mi
+      # Lowered from 80 when the scan path started decoding images.
+      #
+      # photo.TrimTall decodes a JPEG to raw pixels: a 1080x1920 frame is about
+      # 8MB as RGBA, and with the source bytes and the re-encode buffer a scan
+      # in flight costs roughly 15-20MB. At 80 concurrent requests that is over
+      # a gigabyte against a 512Mi limit -- the instance would be OOM-killed by
+      # a burst, and every request on it would fail, including the cheap ones.
+      #
+      # 8 keeps the worst case near 160MB. It also throttles login and profile
+      # reads, which are nearly free, and that trade is deliberate: at current
+      # traffic the throughput is irrelevant and an OOM is not.
+      - --concurrency=8
+      - --timeout=60s
+      - --set-env-vars=APP_ENV=prod,AUTH0_DOMAIN=${_AUTH0_DOMAIN},AUTH0_AUDIENCE=${_AUTH0_AUDIENCE}
+      # AILAB_API_KEY is a credential, so it is mounted from Secret Manager
+      # rather than passed as an env var. Env vars appear in build logs, deploy
+      # history and `gcloud run services describe` output; a vendor key that
+      # bills per call has no business in any of them.
+      - --set-secrets=DATABASE_URL=ayna-database-url:latest,AILAB_API_KEY=ayna-ailab-key:latest
+    waitFor: ['push-api']
+
+  # The worker is closed to the internet. It is woken by the API and by Cloud
+  # Scheduler, both of which authenticate with a service-account token; an open
+  # /wake would let anyone spin up instances and burn the free tier.
+  #
+  # max-instances=2 is a spend cap, not a performance setting: every instance
+  # calls a paid AI vendor, so unbounded scaling is unbounded cost (NFR-7).
+  - id: deploy-worker
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ayna-worker
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker:${_TAG}
+      - --region=${_REGION}
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --min-instances=0
+      - --max-instances=2
+      - --cpu=1
+      - --memory=512Mi
+      - --concurrency=4
+      - --timeout=300s
+      - --set-env-vars=APP_ENV=prod,AUTH0_DOMAIN=${_AUTH0_DOMAIN},AUTH0_AUDIENCE=${_AUTH0_AUDIENCE}
+      - --set-secrets=DATABASE_URL=ayna-database-url:latest
+    waitFor: ['push-worker']
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # No machineType. Cloud Build's free monthly build-minutes apply to the
+  # default machine only -- E2_HIGHCPU_8 bills from the first minute, which
+  # made every deploy cost a few cents for no benefit this project can use.
+  # The trade is roughly 2 minutes against several, on a build nobody waits on.

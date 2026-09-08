@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.ayna.app/events/envelope.schema.json",
+  "title": "Event envelope",
+  "description": "Every domain event is wrapped in this. The envelope is what makes ADR-001's 'in-process bus now, real queue later' painless: the transport changes, the payload shape does not.",
+  "type": "object",
+  "required": ["eventId", "eventType", "occurredAt", "aggregateId", "correlationId", "version", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "pattern": "^evt_[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "Unique per emission. Consumers use it to detect redelivery — River may deliver a job more than once, so handlers must be idempotent."
+    },
+    "eventType": {
+      "type": "string",
+      "pattern": "^[a-z]+[.][a-z]+[.][a-z]+[.]v[0-9]+$",
+      "description": "{module}.{aggregate}.{event}.v{n}. The version suffix means a breaking payload change ships as .v2 ALONGSIDE .v1 rather than mutating a contract consumers already depend on.",
+      "examples": ["skinanalysis.scan.submitted.v1", "skinanalysis.report.generated.v1"]
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the fact became true — not when it was published. A retried publish keeps the original time; otherwise replaying a queue rewrites history."
+    },
+    "aggregateId": { "type": "string" },
+    "correlationId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "The originating HTTP request. Once the worker is a separate process this is the only thing tying 'the user submitted a scan' to 'the worker failed' across two sets of logs (NFR-9)."
+    },
+    "causationId": {
+      "type": "string",
+      "description": "The eventId that caused this one. Correlation says which request; causation says which event. Together they reconstruct a chain rather than a pile."
+    },
+    "version": { "type": "integer", "minimum": 1 },
+    "payload": { "type": "object" }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://api.ayna.app/events/skinanalysis.scan.submitted.v1.schema.json",
+  "title": "ScanSubmitted v1",
+  "description": "A scan was accepted and durably stored. Emitted inside the same transaction that saves the Scan (ADR-004) — so this event existing means the scan exists, with no window where one is true and the other is not.",
+  "type": "object",
+  "required": ["scanId", "userId", "photoRef", "submittedAt", "tier"],
+  "additionalProperties": false,
+  "properties": {
+    "scanId": { "type": "string", "pattern": "^scn_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "userId": { "type": "string", "pattern": "^usr_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "photoRef": {
+      "type": "string",
+      "description": "An object-storage REFERENCE, never the image bytes. Keeps the queue light, and keeps photo lifecycle governed by one system's TTL policy (NFR-4) instead of scattered across every consumer that received a copy.",
+      "examples": ["r2://ayna-photos/usr_01J8.../scn_01J8....jpg"]
+    },
+    "submittedAt": { "type": "string", "format": "date-time" },
+    "tier": {
+      "type": "string",
+      "enum": ["free", "plus", "pro"],
+      "description": "Carried on the event because it selects WHICH MODEL the worker calls (PD-3). Re-reading entitlement at processing time would let a mid-flight upgrade change which vendor ran, making the result unreproducible."
+    }
+  }
+}

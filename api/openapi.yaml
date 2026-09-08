@@ -1,0 +1,796 @@
+openapi: 3.1.0
+
+info:
+  title: Ayna API
+  version: 1.0.0
+  description: |
+    The consumer REST surface for Ayna.
+
+    This file is the contract between the Flutter client and the Go backend.
+    It is not documentation written after the fact — it is the source both
+    sides generate from, and it is checked against the Go domain enums by
+    `internal/contracts` so the two cannot drift apart silently.
+
+    ## Three things that shape almost every response here
+
+    **Severity has five values, not four.** `unknown` is not padding: a concern
+    the analysis could not assess must be representable. Rendering an
+    unassessed concern as `none` would tell someone their skin is clear when
+    nothing ever looked at it, which is the worst thing this API can say.
+
+    **Free-tier reports have no `skinAge` and no `heatmap`.** Those come from
+    the specialist vendor, and the free tier runs a cheaper model (PD-3). Both
+    fields are nullable, and clients must render the absence rather than
+    treating it as an error or substituting a placeholder.
+
+    **Nothing here is a diagnosis.** Every response carrying a result also
+    carries `disclaimer`, and clients are required to display it (NFR-6). It
+    is in the payload rather than hardcoded in the app so the wording can be
+    corrected after review without shipping a release.
+
+  contact:
+    name: Ayna
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.ayna.app/v1
+    description: Production
+  - url: http://localhost:8080/v1
+    description: Local
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Identity
+    description: Local user profile, consent, and account deletion. Authentication itself is Auth0's; these endpoints own what the user is *allowed to do here*.
+  - name: Scans
+    description: The core loop. Submit a photo, poll for status, fetch the report.
+  - name: Profile
+    description: Trend and history.
+  - name: Billing
+    description: Entitlement derived from store receipts.
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Identity
+  # ---------------------------------------------------------------------------
+  /users:
+    post:
+      tags: [Identity]
+      operationId: createUser
+      summary: Create the local profile after Auth0 sign-up
+      description: |
+        Called once, after Auth0 has authenticated the user for the first time.
+        Auth0 answers "who is this person"; this endpoint decides whether they
+        may have an account at all.
+
+        **The age gate lives here (PD-1).** A caller under 18 is refused and no
+        user is created — refusing at creation means there is never an underage
+        record to purge later. `birthYear` alone is collected, never a full date
+        of birth: the year satisfies both the gate and the skin-age comparison,
+        and a full date is more identifying for no added benefit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [birthYear, timezone]
+              properties:
+                birthYear:
+                  type: integer
+                  minimum: 1900
+                  maximum: 2100
+                  example: 1999
+                timezone:
+                  type: string
+                  description: |
+                    IANA zone. Not cosmetic — it defines the week boundaries the
+                    streak is computed in (PD-5). UTC boundaries would credit a
+                    2am scan in Karachi to the previous week, which is invisible
+                    to the user and reads as a bug.
+                  example: Asia/Karachi
+                displayName:
+                  type: string
+                  maxLength: 60
+      responses:
+        "201":
+          description: Profile created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "403":
+          description: |
+            Under the minimum age. Deliberately distinct from a validation
+            error: the client shows a specific, non-punitive screen for this,
+            not a generic failure.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+              example:
+                type: https://api.ayna.app/problems/under-minimum-age
+                title: Below the minimum age
+                status: 403
+                detail: Ayna is available to people aged 18 and over.
+        "409":
+          description: A profile already exists for this identity
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /users/me:
+    get:
+      tags: [Identity]
+      operationId: getCurrentUser
+      summary: The signed-in user, with entitlement
+      description: |
+        The client's source of truth for what to show. `entitlement` decides
+        whether the report screen expects a heatmap and whether the scan button
+        is enabled, so this is fetched on launch and after any purchase.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "404":
+          description: Authenticated but no local profile yet — call POST /users
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+    patch:
+      tags: [Identity]
+      operationId: updateCurrentUser
+      summary: Change the photo retention policy (NFR-4)
+      description: |
+        PATCH rather than PUT: this replaces one field of the profile, and a
+        PUT would imply the client may replace `birthYear`, which PD-1 requires
+        to be immutable after the age gate.
+
+        `photoRetentionDays` is required in the body and `null` is a legal
+        value meaning "keep indefinitely". There is no partial-update
+        ambiguity to resolve because the resource has exactly one mutable
+        field.
+
+        Setting a shorter policy does not delete anything synchronously. The
+        retention sweep runs on its own schedule, so images already past the
+        new window survive until it next runs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [photoRetentionDays]
+              properties:
+                photoRetentionDays:
+                  type: integer
+                  nullable: true
+                  enum: [7, 30, 365, null]
+                  description: Days to keep photos, or null to keep them indefinitely.
+      responses:
+        "200":
+          description: The updated profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400":
+          description: Not one of the offered retention options
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "404":
+          description: Authenticated but no local profile yet
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+    delete:
+      tags: [Identity]
+      operationId: deleteCurrentUser
+      summary: Delete the account, photos, and derived data (FR-11)
+      description: |
+        Returns 202, not 204: deletion is asynchronous because it spans
+        Postgres, object storage and the vendor's side. The response carries
+        the SLA so the client can state a real timeframe rather than "soon".
+      responses:
+        "202":
+          description: Deletion accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestedAt, completesBy]
+                properties:
+                  requestedAt: { type: string, format: date-time }
+                  completesBy:
+                    type: string
+                    format: date-time
+                    description: Outer bound of the purge SLA.
+
+  /consent:
+    post:
+      tags: [Identity]
+      operationId: grantConsent
+      summary: Record explicit consent to photo processing (FR-1)
+      description: |
+        A scan is refused until this exists. Consent is **versioned** — when the
+        wording changes, prior consent does not silently cover the new terms,
+        and the user is asked again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policyVersion, granted]
+              properties:
+                policyVersion:
+                  type: string
+                  example: "2026-08-01"
+                granted:
+                  type: boolean
+                  description: |
+                    Revocation posts `false` rather than deleting the record.
+                    An audit trail that can be erased is not an audit trail.
+      responses:
+        "201":
+          description: Consent recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsentRecord" }
+
+  # ---------------------------------------------------------------------------
+  # Scans — the riskiest flow, specced in full
+  # ---------------------------------------------------------------------------
+  /scans:
+    post:
+      tags: [Scans]
+      operationId: submitScan
+      summary: Submit a photo for analysis
+      description: |
+        Returns **202 immediately**; analysis is asynchronous (FR-3, NFR-2).
+        The client then polls `GET /scans/{scanId}` — see PD-4 for why polling
+        rather than a WebSocket.
+
+        ### Idempotency is not optional here
+
+        Every accepted scan costs a real vendor call. A flaky connection that
+        causes the client to retry would otherwise create two scans, spend
+        twice, and consume two of the user's weekly allowance. Clients **must**
+        send `Idempotency-Key`; a repeat with the same key returns the original
+        202 rather than starting new work.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 64 }
+          description: Client-generated, stable across retries of the same submission.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [photo]
+              properties:
+                photo:
+                  type: string
+                  format: binary
+                  description: JPEG. Max 8 MB.
+            encoding:
+              photo:
+                contentType: image/jpeg
+      responses:
+        "202":
+          description: Accepted for analysis
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: |
+                Seconds to wait before the first poll. Driving the client's
+                first poll from this rather than a hardcoded constant means the
+                cadence can be tuned server-side when real vendor latency is
+                known.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScanAccepted" }
+        "402":
+          description: |
+            Scan allowance exhausted for the current period. The client shows
+            the paywall; `resetsAt` lets it say when the next free scan lands
+            instead of only offering to sell something.
+          content:
+            application/problem+json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Problem"
+                  - type: object
+                    properties:
+                      resetsAt: { type: string, format: date-time }
+        "403":
+          description: No consent on record (FR-1)
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "413":
+          description: Photo exceeds the size limit
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+    get:
+      tags: [Scans]
+      operationId: listScans
+      summary: Past scans, newest first
+      description: |
+        The scans a user has already paid for.
+
+        Without this a completed report is unreachable the moment the user
+        leaves it: they spend one of a small weekly allowance, read the result
+        once, and it is gone. Home also has nothing to show, so it keeps
+        offering a first scan to someone on their fifth.
+
+        Rejected and failed scans are included. They cost the user nothing, but
+        they are part of what happened, and hiding them would make the history
+        disagree with the allowance the user can see.
+      parameters:
+        - name: limit
+          in: query
+          description: |
+            Newest first. Capped server-side — this is backing a phone list,
+            not an export, and an unbounded limit is a way to make a small
+            account cheap to enumerate.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        "200":
+          description: The user's scans, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scans]
+                properties:
+                  scans:
+                    type: array
+                    items: { $ref: "#/components/schemas/ScanSummary" }
+
+  /scans/{scanId}:
+    parameters:
+      - $ref: "#/components/parameters/ScanId"
+    get:
+      tags: [Scans]
+      operationId: getScanStatus
+      summary: Poll analysis status
+      description: |
+        Cheap and cacheless — this is called roughly ten times per scan.
+
+        A `rejected` status is **not an error**: the photo was unusable, no
+        vendor call was made, and crucially **the user's allowance was not
+        spent**. `allowanceSpent` says so explicitly, because a rejected scan
+        that silently cost someone their week would be the app's worst moment.
+      responses:
+        "200":
+          description: Current status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScanStatus" }
+        "404":
+          description: No such scan for this user
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /scans/{scanId}/report:
+    parameters:
+      - $ref: "#/components/parameters/ScanId"
+    get:
+      tags: [Scans]
+      operationId: getScanReport
+      summary: Fetch the completed report
+      responses:
+        "200":
+          description: The report
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SkinReport" }
+        "409":
+          description: |
+            Analysis is not finished. Distinct from 404 so the client can keep
+            polling instead of treating a timing race as a missing resource.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  # ---------------------------------------------------------------------------
+  # Profile
+  # ---------------------------------------------------------------------------
+
+  /scans/{scanId}/heatmap:
+    parameters:
+      - $ref: "#/components/parameters/ScanId"
+    get:
+      tags: [Scans]
+      operationId: getScanHeatmap
+      summary: The redness overlay (FR-4)
+      description: |
+        Returns `image/jpeg`, not JSON — the client puts this straight into an
+        image view, and base64ing it into the report body would inflate it by a
+        third and force a decode before anything could be shown.
+
+        **This is the photo with the overlay already composited onto it.** The
+        original is not stored: keeping an unmarked photograph of every user's
+        face would be a materially heavier thing to be responsible for than an
+        image that is already annotated.
+
+        Only redness is offered. The vendor publishes five maps that correspond
+        to FR-4 concerns; the other four were rejected on inspection — two
+        render the entire face rather than any finding, and two are sparse
+        annotations in a different visual language that are usually blank. There
+        is no acne map at all.
+      responses:
+        "200":
+          description: The composited overlay
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+        "404":
+          description: |
+            No overlay for this scan, or no such scan for this user. The two are
+            deliberately indistinguishable — confirming that a scan id exists
+            tells a caller they have guessed one, and a scan id points at a face.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /profile/me/trend:
+    get:
+      tags: [Profile]
+      operationId: getTrend
+      summary: Score and skin-age history (FR-8)
+      description: |
+        Entitlement-gated. Free users receive a truncated window with
+        `truncated: true` rather than an error — the paywall works because you
+        can see what you are missing, not because the door is unmarked.
+      parameters:
+        - name: period
+          in: query
+          schema:
+            type: string
+            enum: [weeks6, months6, year]
+            default: weeks6
+      responses:
+        "200":
+          description: Trend series
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Trend" }
+
+  # ---------------------------------------------------------------------------
+  # Billing
+  # ---------------------------------------------------------------------------
+  /subscriptions/receipt:
+    post:
+      tags: [Billing]
+      operationId: submitReceipt
+      summary: Validate a store receipt and derive entitlement
+      description: |
+        The app never asserts its own tier. It forwards the store receipt and
+        the server validates it with Apple or Google, because a client that can
+        claim its own entitlement is a client that can grant itself Plus.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform, receipt]
+              properties:
+                platform: { type: string, enum: [apple, google] }
+                receipt: { type: string }
+      responses:
+        "200":
+          description: Entitlement after validation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Entitlement" }
+        "422":
+          description: Receipt rejected by the store
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Auth0-issued access token.
+
+  parameters:
+    ScanId:
+      name: scanId
+      in: path
+      required: true
+      schema: { type: string, pattern: "^scn_[0-9A-HJKMNP-TV-Z]{26}$" }
+      example: scn_01J8XK4M2P9QRSTVWXYZABCDEF
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details. Every error in this API uses this shape.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail:
+          type: string
+          description: |
+            Safe to show a user. Errors say what went wrong and what to do
+            about it — never an apology, never a stack trace.
+        correlationId:
+          type: string
+          description: Ties this response to the server logs (NFR-9).
+
+    Severity:
+      type: string
+      description: |
+        **Five values.** `unknown` means the analysis could not assess this
+        concern — a missing field, a vendor that does not measure it, or a
+        photo that did not show it. Clients must render `unknown` distinctly
+        and must never fall back to `none`.
+      enum: [unknown, none, mild, moderate, severe]
+
+    IssueType:
+      type: string
+      description: The six concerns promised by FR-4. A closed set.
+      enum: [acne, redness, dryness, dark_spots, texture, pores]
+
+    Entitlement:
+      type: object
+      required: [tier, scansRemaining, periodResetsAt]
+      properties:
+        tier: { type: string, enum: [free, plus, pro] }
+        scansRemaining:
+          type: integer
+          minimum: 0
+          description: Remaining in the current period.
+        periodResetsAt: { type: string, format: date-time }
+        hasHeatmap:
+          type: boolean
+          description: |
+            Stated explicitly rather than inferred from `tier`. The client
+            should not encode which tiers include which features — that mapping
+            changes with pricing, and a stale app would then render an empty
+            heatmap slot or hide one the user paid for.
+        hasSkinAge: { type: boolean }
+
+    User:
+      type: object
+      required: [id, birthYear, timezone, entitlement, hasConsent]
+      properties:
+        id: { type: string, example: usr_01J8XK4M2P9QRSTVWXYZABCDEF }
+        displayName: { type: string, nullable: true }
+        birthYear: { type: integer }
+        timezone: { type: string, example: Asia/Karachi }
+        hasConsent:
+          type: boolean
+          description: Whether a current, un-revoked consent record exists for the live policy version.
+        entitlement: { $ref: "#/components/schemas/Entitlement" }
+        streakWeeks:
+          type: integer
+          description: Consecutive ISO weeks with at least one completed scan (PD-5).
+        photoRetentionDays:
+          type: integer
+          nullable: true
+          enum: [7, 30, 365, null]
+          description: |
+            How long photos are kept before the retention sweep clears them
+            (NFR-4). `null` means keep indefinitely, and is a deliberate user
+            choice rather than an unset field: new accounts default to 30.
+
+            Only the image is removed. Scores and the trend survive, because a
+            user asking for their photos to be deleted is not asking for their
+            history to be erased.
+
+    ConsentRecord:
+      type: object
+      required: [policyVersion, granted, recordedAt]
+      properties:
+        policyVersion: { type: string }
+        granted: { type: boolean }
+        recordedAt: { type: string, format: date-time }
+
+    ScanAccepted:
+      type: object
+      required: [scanId, status, estimatedSeconds]
+      properties:
+        scanId: { type: string, example: scn_01J8XK4M2P9QRSTVWXYZABCDEF }
+        status: { type: string, enum: [processing] }
+        estimatedSeconds: { type: integer, example: 8 }
+
+    ScanStatus:
+      type: object
+      required: [scanId, status, allowanceSpent]
+      properties:
+        scanId: { type: string }
+        status:
+          type: string
+          enum: [processing, completed, rejected, failed]
+        stage:
+          type: string
+          description: |
+            Drives the named steps on the analysing screen. A spinner makes
+            eight seconds feel like thirty; named progress does not.
+          enum: [received, quality_checked, scoring, writing_report]
+        allowanceSpent:
+          type: boolean
+          description: |
+            **False for `rejected`.** A quality failure costs the vendor nothing
+            (they do not bill failed requests) and must cost the user nothing
+            either.
+        rejectionReason:
+          type: string
+          nullable: true
+          enum: [blurry, too_dark, no_face_detected, face_too_small, occluded]
+        estimatedSeconds: { type: integer, nullable: true }
+
+    Issue:
+      type: object
+      required: [type, severity]
+      properties:
+        type: { $ref: "#/components/schemas/IssueType" }
+        severity: { $ref: "#/components/schemas/Severity" }
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          nullable: true
+          description: |
+            Problem magnitude — higher is worse. Note this is the **opposite**
+            of the vendor's own scale, where higher means healthier skin; the
+            conversion happens server-side so the client never has to know.
+            Null when severity is `unknown`.
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          nullable: true
+        severityLevels:
+          type: integer
+          enum: [2, 4]
+          description: |
+            How many levels the underlying source can actually distinguish.
+            A vendor returning a presence flag supports two, not four — and a
+            client showing a four-step bar for a two-level signal is lying
+            about precision it does not have.
+
+    SkinReport:
+      type: object
+      required: [scanId, overallScore, issues, disclaimer, generatedAt, rulesetVersion]
+      properties:
+        scanId: { type: string }
+        overallScore:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Higher is better. Rescaled server-side from the vendor's narrower
+            range so the full 0–100 is usable — without it every user clusters
+            in the top third and the trend looks flatter than it is.
+        skinAge:
+          type: integer
+          nullable: true
+          description: Null on tiers without a skin-age reading. Render the absence; never substitute chronological age.
+        chronologicalAge: { type: integer }
+        issues:
+          type: array
+          minItems: 6
+          maxItems: 6
+          description: All six concerns, always. An unmeasured concern appears with severity `unknown`, never omitted — an absent key and a measured `none` must not look the same.
+          items: { $ref: "#/components/schemas/Issue" }
+        heatmapUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: |
+            Short-lived signed URL to the overlay, served directly from object
+            storage rather than proxied. Null on tiers without it.
+        photoUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: Short-lived signed URL to the original photo.
+        referral:
+          $ref: "#/components/schemas/Referral"
+        tip:
+          type: object
+          nullable: true
+          properties:
+            headline: { type: string }
+            body: { type: string }
+        rulesetVersion:
+          type: string
+          description: |
+            Which `SeverityRuleSet` produced these severities (PD-2). Without
+            it you cannot answer "why did it tell me to see a dermatologist in
+            March but not in June with the same skin?" — and under FR-7 and
+            NFR-6 that is exactly the question you must be able to answer.
+        disclaimer:
+          type: string
+          description: Must be displayed (NFR-6). Server-supplied so the wording can be corrected without a release.
+        generatedAt: { type: string, format: date-time }
+
+    Referral:
+      type: object
+      nullable: true
+      description: Present only when severity thresholds were crossed (FR-7).
+      required: [suggested, reason]
+      properties:
+        suggested: { type: boolean }
+        reason: { type: string }
+        triggeredBy:
+          type: array
+          items: { $ref: "#/components/schemas/IssueType" }
+        urgency:
+          type: string
+          enum: [routine]
+          description: |
+            One value, deliberately. This product is not equipped to say
+            "urgent", and an app that can escalate is an app that will
+            eventually escalate wrongly.
+
+    ScanSummary:
+      type: object
+      required: [scanId, status, submittedAt, allowanceSpent]
+      properties:
+        scanId: { type: string }
+        status:
+          type: string
+          enum: [processing, completed, rejected, failed]
+        submittedAt: { type: string, format: date-time }
+        allowanceSpent: { type: boolean }
+        overallScore:
+          type: integer
+          nullable: true
+          description: Null unless the scan completed. A list row must be able to say "no result" without inventing a zero.
+        skinAge: { type: integer, nullable: true }
+        rejectionReason:
+          type: string
+          nullable: true
+          enum: [blurry, too_dark, no_face_detected, face_too_small, occluded]
+
+    TrendPoint:
+      type: object
+      required: [weekStart, overallScore]
+      properties:
+        weekStart:
+          type: string
+          format: date
+          description: ISO week start, in the user's own timezone (PD-5).
+        overallScore: { type: integer }
+        skinAge: { type: integer, nullable: true }
+
+    Trend:
+      type: object
+      required: [period, points, truncated]
+      properties:
+        period: { type: string, enum: [weeks6, months6, year] }
+        points:
+          type: array
+          items: { $ref: "#/components/schemas/TrendPoint" }
+        truncated:
+          type: boolean
+          description: True when entitlement limited the window.
+        totalAvailable:
+          type: integer
+          description: How many points exist in total — lets the client say what is behind the paywall rather than hiding that anything is.

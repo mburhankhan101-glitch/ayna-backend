@@ -1,0 +1,148 @@
+name: CI / Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  GO_VERSION: "1.26"
+  # Oregon: GCP us-west1 and AWS us-west-2 (where Neon lives) are both in
+  # Oregon, so this is the tightest cross-cloud pairing available. Also inside
+  # Cloud Run's always-free tier.
+  REGION: us-west1
+
+jobs:
+  # Gate everything on the checks first. A deploy that runs in parallel with
+  # the tests will happily ship a failing build.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # This is the run that matters. internal/arch enforces the module
+      # boundaries from 05-Project-Structure-and-Contracts, and it is the rule
+      # keeping ADR-001's monolith from becoming a ball of mud. Reviewers
+      # forget; CI does not.
+      - name: Test (includes architecture boundaries)
+        run: go test -race ./...
+
+      - name: Build both binaries
+        run: |
+          go build ./cmd/api
+          go build ./cmd/worker
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    # Workload Identity Federation instead of a long-lived service-account
+    # key. A JSON key in a repo secret is a credential that never expires and
+    # cannot be revoked without noticing it leaked; this mints a short-lived
+    # token per run.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push images
+        env:
+          REGISTRY: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/ayna
+        run: |
+          for cmd in api worker; do
+            docker build \
+              -f deployments/Dockerfile \
+              --build-arg CMD=$cmd \
+              --build-arg VERSION=${GITHUB_SHA::7} \
+              -t $REGISTRY/$cmd:${GITHUB_SHA::7} \
+              -t $REGISTRY/$cmd:latest .
+            docker push --all-tags $REGISTRY/$cmd
+          done
+
+      # KEEP THIS IN STEP WITH deployments/cloudbuild.yaml. Two files describing
+      # one deployment is a standing drift risk, and this one drifted: it sat at
+      # --concurrency=80 with no AILAB_API_KEY long after the scan path started
+      # decoding images and calling a paid vendor. Running it would have shipped
+      # an API that OOMs on any burst and fails every scan with a missing key.
+      #
+      # --concurrency=8: photo.TrimTall decodes JPEGs, ~15-20MB in flight per
+      # scan. 80 of those against a 512Mi limit is an OOM, not a throughput
+      # setting.
+      - name: Deploy API
+        env:
+          REGISTRY: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/ayna
+        run: |
+          gcloud run deploy ayna-api \
+            --image=$REGISTRY/api:${GITHUB_SHA::7} \
+            --region=${{ env.REGION }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --min-instances=0 \
+            --max-instances=4 \
+            --cpu=1 --memory=512Mi \
+            --concurrency=8 \
+            --timeout=60s \
+            --set-env-vars=APP_ENV=prod,AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }} \
+            --set-secrets=DATABASE_URL=ayna-database-url:latest,AILAB_API_KEY=ayna-ailab-key:latest
+
+      # --no-allow-unauthenticated: the worker is woken by the API and by
+      # Cloud Scheduler, both of which authenticate with a service-account
+      # token. An open /wake endpoint would let anyone on the internet spin
+      # up instances and burn the free tier.
+      #
+      # --max-instances=2 caps AI spend: each instance calls a paid vendor
+      # API, so unbounded scaling is unbounded cost (NFR-7).
+      - name: Deploy worker
+        env:
+          REGISTRY: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/ayna
+        run: |
+          gcloud run deploy ayna-worker \
+            --image=$REGISTRY/worker:${GITHUB_SHA::7} \
+            --region=${{ env.REGION }} \
+            --platform=managed \
+            --no-allow-unauthenticated \
+            --min-instances=0 \
+            --max-instances=2 \
+            --cpu=1 --memory=512Mi \
+            --concurrency=4 \
+            --timeout=300s \
+            --set-env-vars=APP_ENV=prod,AUTH0_DOMAIN=${{ secrets.AUTH0_DOMAIN }},AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }} \
+            --set-secrets=DATABASE_URL=ayna-database-url:latest
+
+      # A deploy that reports success without the service answering is worse
+      # than a failed deploy, because nobody looks again.
+      - name: Smoke test
+        run: |
+          url=$(gcloud run services describe ayna-api \
+            --region=${{ env.REGION }} --format='value(status.url)')
+          echo "Deployed to $url"
+          curl -fsS --retry 5 --retry-delay 3 "$url/healthz" | tee /dev/stderr
+          curl -fsS --retry 5 --retry-delay 3 "$url/readyz"  | tee /dev/stderr
