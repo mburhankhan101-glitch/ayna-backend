@@ -42,10 +42,19 @@ jobs:
       - name: Test (includes architecture boundaries)
         run: go test -race ./...
 
+      # Built into a temp directory, never the repo root.
+      #
+      # `go build ./cmd/api` writes a binary named `api` beside the source, and
+      # this repo has an `api/` directory holding the OpenAPI contract. Go
+      # refuses to overwrite a directory, so that form fails with "build output
+      # api already exists and is a directory" -- and it fails on the runner
+      # only, because `go build ./...` discards binaries when it is given more
+      # than one package. The local command and the CI command disagreed.
+      #
+      # This step exists to prove both entry points link. The images are built
+      # by Docker further down, so the binaries here are throwaway.
       - name: Build both binaries
-        run: |
-          go build ./cmd/api
-          go build ./cmd/worker
+        run: go build -o "${RUNNER_TEMP}/bin/" ./cmd/api ./cmd/worker
 
   deploy:
     needs: check
